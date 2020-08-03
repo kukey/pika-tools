@@ -284,51 +284,102 @@ Status Binlog::Produce(const Slice &item, int *temp_pro_offset) {
 
   return s;
 }
- 
-Status Binlog::AppendBlank(slash::WritableFile *file, uint64_t len) {
-  if (len < kHeaderSize) {
-    return Status::OK();
-  }
+//
+//Status Binlog::AppendBlank(slash::WritableFile *file, uint64_t len) {
+//  if (len < kHeaderSize) {
+//    return Status::OK();
+//  }
+//
+//  uint64_t pos = 0;
+//
+//  std::string blank(kBlockSize, ' ');
+//  for (; pos + kBlockSize < len; pos += kBlockSize) {
+//    file->Append(Slice(blank.data(), blank.size()));
+//  }
+//
+//  // Append a msg which occupy the remain part of the last block
+//  // We simply increase the remain length to kHeaderSize when remain part < kHeaderSize
+//  uint32_t n;
+//  if (len % kBlockSize < kHeaderSize) {
+//    n = 0;
+//  } else {
+//    n = (uint32_t) ((len % kBlockSize) - kHeaderSize);
+//  }
+//
+//  char buf[kBlockSize];
+//  uint64_t now;
+//  struct timeval tv;
+//  gettimeofday(&tv, NULL);
+//  now = tv.tv_sec;
+//  buf[0] = static_cast<char>(n & 0xff);
+//  buf[1] = static_cast<char>((n & 0xff00) >> 8);
+//  buf[2] = static_cast<char>(n >> 16);
+//  buf[3] = static_cast<char>(now & 0xff);
+//  buf[4] = static_cast<char>((now & 0xff00) >> 8);
+//  buf[5] = static_cast<char>((now & 0xff0000) >> 16);
+//  buf[6] = static_cast<char>((now & 0xff000000) >> 24);
+//  buf[7] = static_cast<char>(kFullType);
+//
+//  Status s = file->Append(Slice(buf, kHeaderSize));
+//  if (s.ok()) {
+//    s = file->Append(Slice(blank.data(), n));
+//    if (s.ok()) {
+//      s = file->Flush();
+//    }
+//  }
+//  return s;
+//}
+//
 
-  uint64_t pos = 0;
-
-  std::string blank(kBlockSize, ' ');
-  for (; pos + kBlockSize < len; pos += kBlockSize) {
-    file->Append(Slice(blank.data(), blank.size()));
-  }
-
-  // Append a msg which occupy the remain part of the last block
-  // We simply increase the remain length to kHeaderSize when remain part < kHeaderSize
-  uint32_t n;
-  if (len % kBlockSize < kHeaderSize) {
-    n = 0;
-  } else {
-    n = (uint32_t) ((len % kBlockSize) - kHeaderSize);
-  }
-
-  char buf[kBlockSize];
-  uint64_t now;
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  now = tv.tv_sec;
-  buf[0] = static_cast<char>(n & 0xff);
-  buf[1] = static_cast<char>((n & 0xff00) >> 8);
-  buf[2] = static_cast<char>(n >> 16);
-  buf[3] = static_cast<char>(now & 0xff);
-  buf[4] = static_cast<char>((now & 0xff00) >> 8);
-  buf[5] = static_cast<char>((now & 0xff0000) >> 16);
-  buf[6] = static_cast<char>((now & 0xff000000) >> 24);
-  buf[7] = static_cast<char>(kFullType);
-
-  Status s = file->Append(Slice(buf, kHeaderSize));
-  if (s.ok()) {
-    s = file->Append(Slice(blank.data(), n));
-    if (s.ok()) {
-      s = file->Flush();
+Status Binlog::AppendPadding(slash::WritableFile* file, uint64_t* len) {
+    if (*len < kHeaderSize) {
+        return Status::OK();
     }
-  }
-  return s;
+
+    Status s;
+    char buf[kBlockSize];
+    uint64_t now;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    now = tv.tv_sec;
+
+    uint64_t left = *len;
+    while (left > 0 && s.ok()) {
+        uint32_t size = (left >= kBlockSize) ? kBlockSize : left;
+        if (size < kHeaderSize) {
+            break;
+        } else {
+            uint32_t bsize = size - kHeaderSize;
+            std::string binlog = PortBinlogTransverter::ConstructPaddingBinlog(
+                    PortBinlogType::PortTypeFirst, bsize);
+            if (binlog.empty()) {
+                break;
+            }
+            buf[0] = static_cast<char>(bsize & 0xff);
+            buf[1] = static_cast<char>((bsize & 0xff00) >> 8);
+            buf[2] = static_cast<char>(bsize >> 16);
+            buf[3] = static_cast<char>(now & 0xff);
+            buf[4] = static_cast<char>((now & 0xff00) >> 8);
+            buf[5] = static_cast<char>((now & 0xff0000) >> 16);
+            buf[6] = static_cast<char>((now & 0xff000000) >> 24);
+            buf[7] = static_cast<char>(kFullType);
+            s = file->Append(Slice(buf, kHeaderSize));
+            if (s.ok()) {
+                s = file->Append(Slice(binlog.data(), binlog.size()));
+                if (s.ok()) {
+                    s = file->Flush();
+                    left -= size;
+                }
+            }
+        }
+    }
+    *len -= left;
+    return s;
 }
+
+
+
+
 
 Status Binlog::SetProducerStatus(uint32_t pro_num, uint64_t pro_offset) {
   slash::MutexLock l(&mutex_);
@@ -351,7 +402,7 @@ Status Binlog::SetProducerStatus(uint32_t pro_num, uint64_t pro_offset) {
   }
 
   slash::NewWritableFile(profile, &queue_);
-  Binlog::AppendBlank(queue_, pro_offset);
+  Binlog::AppendPadding(queue_, &pro_offset);
 
   pro_num_ = pro_num;
 

@@ -82,7 +82,7 @@ bool TrysyncThread::Send(std::string lip) {
   argv.push_back(std::to_string(g_conf.local_port));
   uint32_t filenum;
   uint64_t pro_offset;
-  g_pika_port->logger()->GetProducerStatus(&filenum, &pro_offset);
+  g_pika_port->logger_->GetProducerStatus(&filenum, &pro_offset);
   pinfo("producer filenum: %u, producer offset:%llu", filenum, pro_offset);
 
   argv.push_back(std::to_string(filenum));
@@ -218,7 +218,7 @@ bool TrysyncThread::TryUpdateMasterOffset() {
   slash::DeleteFile(info_path);
 
   // Update master offset
-  g_pika_port->logger()->SetProducerStatus(filenum, offset);
+  g_pika_port->logger_->SetProducerStatus(filenum, offset);
   Retransmit();
   g_pika_port->WaitDBSyncFinish();
 
@@ -420,13 +420,8 @@ void* TrysyncThread::ThreadMain() {
     cli_->set_recv_timeout(30000);
 
     std::string lip(g_conf.local_ip);
-    // Bug Fix by AS on 20190414  22:22 pm:
     // the pika master module name rule is: document_${slave_ip}:master_port
-    //
-    // document_${master_ip}:${master_port}
-    // std::string ip_port = slash::IpPortString(master_ip, master_port);
-    //
-    // document_${slave_ip}:master_port
+
     std::string ip_port = slash::IpPortString(g_conf.master_ip, master_port);
     // We append the master ip port after module name
     // To make sure only data from current master is received
@@ -445,8 +440,9 @@ void* TrysyncThread::ThreadMain() {
     int retry_times;
     for (retry_times = 0; retry_times < 5; retry_times++) {
       if (rsync->Connect(lip, rsync_port, "").ok()) {
-        pinfo("rsync successfully started, address:%s:%d", lip.c_str(), rsync_port);
+        pinfo("rsync successfully started, address:%s:%d, retry times %d", lip.c_str(), rsync_port,retry_times);
         rsync->Close();
+        delete rsync;
         break;
       }
 

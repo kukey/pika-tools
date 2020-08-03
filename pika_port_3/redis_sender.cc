@@ -36,14 +36,14 @@ void RedisSender::ConnectRedis() {
     cli_->set_send_timeout(10000);
     slash::Status s = cli_->Connect(ip_, port_);
     if (!s.ok()) {
-      delete cli_;
       cli_ = NULL;
       log_info("Can not connect to %s:%d: %s", ip_.data(), port_, s.ToString().data());
+        //pinfo("Can not connect to %s:%d: %s", ip_.data(), port_, s.ToString().data());
       continue;
     } else {
       // Connect success
       log_info("Connect to %s:%d:%s", ip_.data(), port_, s.ToString().data());
-
+      // pinfo("Connect to %s:%d:%s", ip_.data(), port_, s.ToString().data());
       // Authentication
       if (!password_.empty()) {
         pink::RedisCmdArgsType argv, resp;
@@ -111,7 +111,7 @@ void RedisSender::Stop() {
 
 void RedisSender::SendRedisCommand(const std::string &command) {
   commands_mutex_.Lock();
-  if (commands_queue_.size() < 100000) {
+  if (commands_queue_.size() < 1000) {
     commands_queue_.push(command);
     rsignal_.Signal();
     commands_mutex_.Unlock();
@@ -119,7 +119,7 @@ void RedisSender::SendRedisCommand(const std::string &command) {
   }
 
   pwarn("%d commands queue size is beyond 100000", id_);
-  while (commands_queue_.size() > 100000) {
+  while (commands_queue_.size() >= 1000) {
     wsignal_.Wait();
   }
   commands_queue_.push(command);
@@ -140,6 +140,7 @@ int RedisSender::SendCommand(std::string &command) {
   // Send command
   int idx = 0;
   do {
+
     slash::Status s = cli_->Send(&command);
     if (s.ok()) {
       return 0;
@@ -148,7 +149,6 @@ int RedisSender::SendCommand(std::string &command) {
     pwarn("RedisSender %d fails to send redis command %s, times:%d", id_, command.c_str(), idx+1);
     cli_->Close();
     log_info("%s", s.ToString().data());
-    delete cli_;
     cli_ = NULL;
     ConnectRedis();
   } while(++idx < 3);
@@ -191,6 +191,7 @@ void *RedisSender::ThreadMain() {
     commands_queue_.pop();
     wsignal_.Signal();
     commands_mutex_.Unlock();
+    // pinfo("send  command is %s ",command.c_str());
     ret = SendCommand(command);
     if (ret == 0) {
       cnt++;

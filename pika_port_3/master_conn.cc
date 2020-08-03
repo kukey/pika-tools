@@ -4,8 +4,7 @@
 // of patent rights can be found in the PATENTS file in the same directory.
 
 
-#include "slash/include/slash_string.h"
-#include "slash/include/slash_coding.h"
+#include <iostream>
 
 #include "binlog_transverter.h"
 #include "const.h"
@@ -20,233 +19,138 @@ MasterConn::MasterConn(int fd, std::string ip_port, void* worker_specific_data)
     : PinkConn(fd, ip_port, NULL),
       rbuf_(nullptr),
       rbuf_len_(0),
-      rbuf_size_(REDIS_IOBUF_LEN),
-      rbuf_cur_pos_(0),
-      is_authed_(false) {
-  binlog_receiver_ = reinterpret_cast<BinlogReceiverThread*>(worker_specific_data);
-  rbuf_ = static_cast<char*>(realloc(rbuf_, REDIS_IOBUF_LEN));
+      msg_peak_(0),
+      is_authed_(false),
+      last_read_pos_(-1),
+      bulk_len_(-1) {
+    binlog_receiver_ = reinterpret_cast<BinlogReceiverThread*>(worker_specific_data);
+    pink::RedisParserSettings settings;
+    settings.DealMessage = &(MasterConn::DealMessage);
+    redis_parser_.RedisParserInit(REDIS_PARSER_REQUEST, settings);
+    redis_parser_.data = this;
 }
 
 MasterConn::~MasterConn() {
   free(rbuf_);
 }
 
-pink::ReadStatus MasterConn::ReadRaw(uint32_t count) {
-  if (rbuf_cur_pos_ + count > rbuf_size_) {
-    return pink::kFullError;
-  }
-  int32_t nread = read(fd(), rbuf_ + rbuf_len_, count - (rbuf_len_ - rbuf_cur_pos_));
-  if (nread == -1) {
-    if (errno == EAGAIN) {
-      return pink::kReadHalf;
+
+pink::ReadStatus MasterConn::ParseRedisParserStatus(pink::RedisParserStatus status) {
+    if (status == pink::kRedisParserInitDone) {
+        return pink::kOk;
+    } else if (status == pink::kRedisParserHalf) {
+        return pink::kReadHalf;
+    } else if (status == pink::kRedisParserDone) {
+        return pink::kReadAll;
+    } else if (status == pink::kRedisParserError) {
+        pink::RedisParserError error_code = redis_parser_.get_error_code();
+        switch (error_code) {
+            case pink::kRedisParserOk :
+                // status is error cant be ok
+                return pink::kReadError;
+            case pink::kRedisParserInitError :
+                return pink::kReadError;
+            case pink::kRedisParserFullError :
+                return pink::kFullError;
+            case pink::kRedisParserProtoError :
+                return pink::kParseError;
+            case pink::kRedisParserDealError :
+                return pink::kDealError;
+            default :
+                return pink::kReadError;
+        }
     } else {
-      return pink::kReadError;
+        return pink::kReadError;
     }
-  } else if (nread == 0) {
-    return pink::kReadClose;
-  }
-
-  rbuf_len_ += nread;
-  if (rbuf_len_ - rbuf_cur_pos_ != count) {
-    return pink::kReadHalf;
-  }
-  return pink::kReadAll;
 }
 
-pink::ReadStatus MasterConn::ReadHeader() {
-  if (rbuf_len_ >= HEADER_LEN) {
-    return pink::kReadAll;
-  }
 
-  pink::ReadStatus status = ReadRaw(HEADER_LEN);
-  if (status != pink::kReadAll) {
-    return status;
-  }
-  rbuf_cur_pos_ += HEADER_LEN;
-  return pink::kReadAll;
-}
 
-pink::ReadStatus MasterConn::ReadBody(uint32_t body_length) {
-  if (rbuf_len_ == HEADER_LEN + body_length) {
-    return pink::kReadAll;
-  } else if (rbuf_len_ > HEADER_LEN + body_length) {
-    pinfo("rbuf_len_ larger than sum of header length "
-	  "(6 Byte) and body_length, rbuf_len_:%u, body_length:%u",
-	  rbuf_len_, body_length);
-  }
-
-  pink::ReadStatus status = ReadRaw(body_length);
-  if (status != pink::kReadAll) {
-    return status;
-  }
-  rbuf_cur_pos_ += body_length;
-  return pink::kReadAll;
-}
-
-int32_t MasterConn::FindNextSeparators(const std::string& content, int32_t pos) {
-  int32_t length = content.size();
-  if (pos >= length) {
-    return -1;
-  }
-  while (pos < length) {
-    if (content[pos] == '\n') {
-      return pos;
-    }
-    pos++;
-  }
-  return -1;
-}
-
-int32_t MasterConn::GetNextNum(const std::string& content, int32_t left_pos, int32_t right_pos, long* value) {
-  //  left_pos        right_pos
-  //      |------   -------|
-  //            |   |
-  //            *3\r\n
-  //            012 3
-  // num range [left_pos + 1, right_pos - 2]
-  assert(left_pos < right_pos);
-  if (slash::string2l(content.data() + left_pos + 1,  right_pos - left_pos - 2, value)) {
-    return 0;
-  }
-  return -1;
-}
-
-// RedisRESPArray : *3\r\n$3\r\nset\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
-pink::ReadStatus MasterConn::ParseRedisRESPArray(const std::string& content, pink::RedisCmdArgsType* argv) {
-  int32_t pos = 0;
-  int32_t next_parse_pos = 0;
-  int32_t content_len = content.size();
-  long multibulk_len = 0, bulk_len = 0;
-  if (content.empty() || content[0] != '*') {
-    pinfo("Content empty() or the first character of the redis protocol string not equal '*'");
-    return pink::kParseError;
-  }
-  pos = FindNextSeparators(content, next_parse_pos);
-  if (pos != -1 && GetNextNum(content, next_parse_pos, pos, &multibulk_len) != -1) {
-    next_parse_pos = pos + 1;
-  } else {
-    pinfo("Find next separators error or get next num error");
-    return pink::kParseError;
-  }
-
-  // next_parst_pos          pos
-  //        |-------   -------|
-  //               |   |
-  //               $3\r\nset\r\n
-  //               012 3 4567 8
-
-  argv->clear();
-  while (multibulk_len) {
-    if (content[next_parse_pos] != '$') {
-      pinfo("The first charactor of the RESP type element not equal '$'");
-      return pink::kParseError;
-    }
-
-    bulk_len = -1;
-    pos = FindNextSeparators(content, next_parse_pos);
-    if (pos != -1 && GetNextNum(content, next_parse_pos, pos, &bulk_len) != -1) {
-      if (pos + 1 + bulk_len + 2 > content_len) {
-        return pink::kParseError;
-      } else {
-        next_parse_pos = pos + 1;
-        argv->emplace_back(content.data() + next_parse_pos, bulk_len);
-        next_parse_pos = next_parse_pos + bulk_len + 2;
-        multibulk_len--;
-      }
-    } else {
-      pinfo("Find next separators error or get next num error");
-      return pink::kParseError;
-    }
-  }
-  if (content_len != next_parse_pos) {
-    pinfo("Incomplete parse");
-    return pink::kParseError;
-  } else {
-    return pink::kOk;
-  }
-}
-
-void MasterConn::ResetStatus() {
-  rbuf_len_ = 0;
-  rbuf_cur_pos_ = 0;
-}
 
 
 pink::ReadStatus MasterConn::GetRequest() {
-  // Read Header
-  pink::ReadStatus status;
-  if ((status = ReadHeader()) != pink::kReadAll) {
-    return status;
-  }
+    ssize_t nread = 0;
+    int next_read_pos = last_read_pos_ + 1;
 
-  // Process Header, get body length;
-  uint16_t type = 0;
-  uint32_t body_length = 0;
-  std::string header(rbuf_, HEADER_LEN);
-  slash::GetFixed16(&header, &type);
-  slash::GetFixed32(&header, &body_length);
+    int remain = rbuf_len_ - next_read_pos;  // Remain buffer size
+    int new_size = 0;
+    if (remain == 0) {
+        new_size = rbuf_len_ + REDIS_IOBUF_LEN;
+        remain += REDIS_IOBUF_LEN;
+    } else if (remain < bulk_len_) {
+        new_size = next_read_pos + bulk_len_;
+        remain = bulk_len_;
+    }
+    if (new_size > rbuf_len_) {
+        if (new_size > REDIS_MAX_MESSAGE) {
+            return pink::kFullError;
+        }
+        rbuf_ = static_cast<char*>(realloc(rbuf_, new_size));
+        if (rbuf_ == nullptr) {
+            return pink::kFullError;
+        }
+        rbuf_len_ = new_size;
+    }
 
-  if (type != kTypePortAuth && type != kTypePortBinlog) {
-    pinfo("Unrecognizable Type: %u maybe identify binlog type error", type);
-    return pink::kParseError;
-  }
+    nread = read(fd(), rbuf_ + next_read_pos, remain);
+    if (nread == -1) {
+        if (errno == EAGAIN) {
+            nread = 0;
+            return pink::kReadHalf; // HALF
+        } else {
+            // error happened, close client
+            return pink::kReadError;
+        }
+    } else if (nread == 0) {
+        // client closed, close client
+        return pink::kReadClose;
+    }
 
-  // Realloc buffer according header_len and body_length if need
-  uint32_t needed_size = HEADER_LEN + body_length;
-  if (rbuf_size_ < needed_size) {
-    if (needed_size > REDIS_MAX_MESSAGE) {
-      return pink::kFullError;
-    } else {
-      rbuf_ = static_cast<char*>(realloc(rbuf_, needed_size));
-      rbuf_size_ = needed_size;
-    }
-  }
+    // assert(nread > 0);
+    last_read_pos_ += nread;
+    msg_peak_ = last_read_pos_;
 
-  // Read Body
-  if ((status = ReadBody(body_length)) != pink::kReadAll) {
-    return status;
-  }
+    char* cur_process_p = rbuf_ + next_read_pos;
+    int processed_len = 0;
+    pink::ReadStatus read_status = pink::kReadError;
+    while (processed_len < nread) {
+        int remain = nread - processed_len;
+        int scrubed_len = 0; // len binlog parser may scrub
+        char* cur_scrub_start = cur_process_p + processed_len;
+        int cur_bp_processed_len = 0; // current binlog parser processed len
+        pink::ReadStatus scrub_status = binlog_parser_.ScrubReadBuffer(cur_scrub_start, remain, &cur_bp_processed_len, &scrubed_len, &binlog_header_, &binlog_item_);
+        processed_len += cur_bp_processed_len;
+        // return kReadAll or kReadHalf or kReadError
+        if (scrub_status != pink::kReadAll) {
+            read_status = scrub_status;
+            break;
+        }
 
-  pink::RedisCmdArgsType argv;
-  std::string body(rbuf_ + HEADER_LEN, body_length);
-  if (type == kTypePortAuth) {
-    if ((status = ParseRedisRESPArray(body, &argv)) != pink::kOk) {
-      pinfo("Type auth ParseRedisRESPArray error");
-      return status;
-    }
-    if (!ProcessAuth(argv)) {
-      return pink::kDealError;
-    }
-  } else if (type == kTypePortBinlog) {
-    PortBinlogItem item;
-    if (!PortBinlogTransverter::PortBinlogDecode(PortTypeFirst, body, &item)) {
-      pinfo("Binlog decode error: %s", item.ToString().c_str());
-      return pink::kParseError;
-    }
-    if ((status = ParseRedisRESPArray(item.content(), &argv)) != pink::kOk) {
-      pinfo("Type Binlog ParseRedisRESPArray error: %s", item.ToString().c_str());
-      return status;
-    }
-    if (!ProcessBinlogData(argv, item)) {
-      return pink::kDealError;
-    }
-  } else {
-    pinfo("Unrecognizable Type");
-    return pink::kParseError;
-  }
+        char* cur_redis_parser_start = cur_scrub_start + scrubed_len;
+        int cur_parser_buff_len = cur_bp_processed_len - scrubed_len;
+        int redis_parser_processed_len = 0; // parsed len already updated by cur_bp_processed_len useless here
 
-  // Reset status
-  ResetStatus();
-  return pink::kReadAll;
+        pink::RedisParserStatus ret = redis_parser_.ProcessInputBuffer(
+                cur_redis_parser_start, cur_parser_buff_len, &redis_parser_processed_len);
+        read_status = ParseRedisParserStatus(ret);
+        if (read_status != pink::kReadAll) {
+            break;
+        }
+    }
+    if (read_status == pink::kReadAll || read_status == pink::kReadHalf) {
+        last_read_pos_ = -1;
+        bulk_len_ = redis_parser_.get_bulk_len();
+    }
+    return read_status;
 }
+
 
 pink::WriteStatus MasterConn::SendReply() {
   return pink::kWriteAll;
 }
 
-void MasterConn::TryResizeBuffer() {
-}
 
+// -----------------
 bool MasterConn::ProcessAuth(const pink::RedisCmdArgsType& argv) {
   if (argv.empty() || argv.size() != 2) {
     return false;
@@ -275,11 +179,15 @@ bool MasterConn::ProcessBinlogData(const pink::RedisCmdArgsType& argv, const Por
     return false;
   }
 
+
   std::string key(" ");
   if (1 < argv.size()) {
     key = argv[1];
   }
-  int ret = g_pika_port->SendRedisCommand(binlog_item.content(), key);
+
+    std::string wbuf_str;
+  pink::SerializeRedisCommand(argv, &wbuf_str);
+    int ret = g_pika_port->SendRedisCommand(wbuf_str, key);
   if (ret != 0) {
     pwarn("send redis command:%s, ret:%d", binlog_item.ToString().c_str(), ret);
   }
@@ -287,3 +195,14 @@ bool MasterConn::ProcessBinlogData(const pink::RedisCmdArgsType& argv, const Por
   return true;
 }
 
+int MasterConn::DealMessage(pink::RedisParser* parser, const pink::RedisCmdArgsType& argv) {
+    MasterConn* conn = reinterpret_cast<MasterConn*>(parser->data);
+    if (conn->binlog_header_.header_type_ == kTypeAuth) {
+        return conn->ProcessAuth(argv) == true ? 0 : -1;
+    } else if (conn->binlog_header_.header_type_ == kTypeBinlog) {
+        return conn->ProcessBinlogData(argv, conn->binlog_item_) == true ? 0 : -1;
+    }else{
+        pinfo("wrong type");
+    }
+    return -1;
+}

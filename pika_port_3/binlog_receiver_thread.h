@@ -8,27 +8,24 @@
 
 #include <string>
 #include <queue>
-
 #include "pink/include/server_thread.h"
 #include "slash/include/slash_mutex.h"
+#include "slash/include/env.h"
+
+#include "log.h"
 #include "pika_define.h"
 #include "master_conn.h"
-
+#include "pika_command.h"
 class BinlogReceiverThread {
 public:
-  BinlogReceiverThread(std::string host, int port, int cron_interval = 0);
+    BinlogReceiverThread(std::string host, int port, int cron_interval = 0);
+
   virtual ~BinlogReceiverThread();
   int StartThread();
 
   void KillBinlogSender();
 
-  // uint64_t GetnPlusSerial() {
-  //   return serial_++;
-  // }
 
-  // Cmd* GetCmd(const std::string& opt) {
-  //   return GetCmdFromTable(opt, cmds_);
-  // }
 
 
  private:
@@ -38,13 +35,19 @@ public:
         : binlog_receiver_(binlog_receiver) {
     }
 
-    virtual pink::PinkConn *NewPinkConn(
-	    int connfd,
-        const std::string &ip_port,
-        pink::ServerThread *thread,
-        void* worker_specific_data) const override {
-      return new MasterConn(connfd, ip_port, binlog_receiver_);
-    }
+
+      virtual std::shared_ptr<pink::PinkConn> NewPinkConn(
+              int connfd,
+              const std::string &ip_port,
+              pink::Thread *thread,
+              void* worker_specific_data,
+              pink::PinkEpoll* pink_epoll) const override {
+        pinfo("Master conn factory creat pika binlog conn ip_port : %s",ip_port.c_str());
+              return std::make_shared<MasterConn>(connfd, ip_port, binlog_receiver_);
+      }
+
+
+
 
    private:
     BinlogReceiverThread* binlog_receiver_;
@@ -55,7 +58,7 @@ public:
     explicit Handles(BinlogReceiverThread* binlog_receiver)
         : binlog_receiver_(binlog_receiver) {
     }
-
+    using pink::ServerHandle::AccessHandle;
     bool AccessHandle(std::string& ip) const override;
 
   private:
@@ -66,7 +69,6 @@ public:
   Handles handles_;
   pink::ServerThread* thread_rep_;
 
-  // CmdTable cmds_;
-  // uint64_t serial_;
+
 };
 #endif

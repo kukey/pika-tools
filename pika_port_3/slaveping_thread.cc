@@ -32,6 +32,7 @@ Status SlavepingThread::RecvProc() {
   Status s = cli_->Recv(&argv);
   if (s.ok()) {
     slash::StringToLower(argv[0]);
+    // pinfo("ping success");
     // LOG(INFO) << "Reply from master after ping: " << argv[0];
     if (argv[0] == "pong" || argv[0] == "ok") {
     } else {
@@ -74,7 +75,6 @@ void* SlavepingThread::ThreadMain() {
           s = RecvProc();
         }
         if (s.ok()) {
-          // pinfo("Ping master success");
           gettimeofday(&last_interaction, NULL);
         } else if (s.IsTimeout()) {
           pwarn("Slaveping timeout once");

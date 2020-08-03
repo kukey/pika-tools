@@ -2,10 +2,11 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree. An additional grant
 // of patent rights can be found in the PATENTS file in the same directory.
-
+#include <sstream>
+#include <assert.h>
 #include "binlog_transverter.h"
 #include "log.h"
-
+#include "pika_command.h"
 uint32_t PortBinlogItem::exec_time() const {
   return exec_time_;
 }
@@ -117,3 +118,97 @@ bool PortBinlogTransverter::PortBinlogDecode(PortBinlogType type, const std::str
   binlog_str.erase(0, content_length);
   return true;
 }
+
+/*
+ * *************************************************Type First Binlog Item Format**************************************************
+ * |  <Type>  | <Create Time> | <Server Id> | <Binlog Logic Id> | <File Num> | <Offset> | <Content Length> |       <Content>      |
+ * | 2 Bytes  |    4 Bytes    |   4 Bytes   |      8 Bytes      |   4 Bytes  |  8 Bytes |     4 Bytes      | content length Bytes |
+ * |---------------------------------------------- 34 Bytes -----------------------------------------------|
+ *
+ * content: *2\r\n$7\r\npadding\r\n$00001\r\n***\r\n
+ *          length of *** -> total_len - PADDING_BINLOG_PROTOCOL_SIZE - SPACE_STROE_PARAMETER_LENGTH;
+ *
+ * We allocate five bytes to store the length of the parameter
+ */
+std::string PortBinlogTransverter::ConstructPaddingBinlog(PortBinlogType type,
+                                                          uint32_t size) {
+    assert(size <= kBlockSize - kHeaderSize);
+    assert(BINLOG_ITEM_HEADER_SIZE + PADDING_BINLOG_PROTOCOL_SIZE
+           + SPACE_STROE_PARAMETER_LENGTH <= size);
+
+    std::string binlog;
+    slash::PutFixed16(&binlog, type);
+    slash::PutFixed32(&binlog, 0);
+    slash::PutFixed32(&binlog, 0);
+    slash::PutFixed64(&binlog, 0);
+    slash::PutFixed32(&binlog, 0);
+    slash::PutFixed64(&binlog, 0);
+    int32_t content_len = size - BINLOG_ITEM_HEADER_SIZE;
+    int32_t parameter_len = content_len - PADDING_BINLOG_PROTOCOL_SIZE
+                            - SPACE_STROE_PARAMETER_LENGTH;
+    if (parameter_len < 0) {
+        return std::string();
+    }
+
+    std::string content;
+    RedisAppendLen(content, 2, "*");
+    RedisAppendLen(content, 7, "$");
+    RedisAppendContent(content, "padding");
+
+    std::string parameter_len_str;
+    std::ostringstream os;
+    os << parameter_len;
+    std::istringstream is(os.str());
+    is >> parameter_len_str;
+    if (parameter_len_str.size() > SPACE_STROE_PARAMETER_LENGTH) {
+        return std::string();
+    }
+
+    content.append("$");
+    content.append(SPACE_STROE_PARAMETER_LENGTH - parameter_len_str.size(), '0');
+    content.append(parameter_len_str);
+    content.append(kNewLine);
+    RedisAppendContent(content, std::string(parameter_len, '*'));
+
+    slash::PutFixed32(&binlog, content_len);
+    binlog.append(content);
+    return binlog;
+}
+
+bool PortBinlogTransverter::BinlogItemWithoutContentDecode(PortBinlogType type,
+                                                           const std::string& binlog,
+                                                           PortBinlogItem* binlog_item) {
+    uint16_t binlog_type = 0;
+    std::string binlog_str = binlog;
+    slash::GetFixed16(&binlog_str, &binlog_type);
+    if (binlog_type != type) {
+        pinfo("Binlog Item type error, expect type: %s actualy type:  %s", type, binlog_type);
+        return false;
+    }
+    slash::GetFixed32(&binlog_str, &binlog_item->exec_time_);
+    slash::GetFixed32(&binlog_str, &binlog_item->server_id_);
+    slash::GetFixed64(&binlog_str, &binlog_item->logic_id_);
+    slash::GetFixed32(&binlog_str, &binlog_item->filenum_);
+    slash::GetFixed64(&binlog_str, &binlog_item->offset_);
+    return true;
+}
+
+bool PortBinlogTransverter::BinlogHeaderDecode(PortBinlogType type,
+                                               const std::string& header,
+                                               BinlogHeader* binlog_header) {
+    std::string header_str = header;
+    slash::GetFixed16(&header_str, &(binlog_header->header_type_));
+    slash::GetFixed32(&header_str, &(binlog_header->item_length_));
+    if (binlog_header->header_type_ != kTypeAuth && binlog_header->header_type_ != kTypeBinlog) {
+        pinfo("Unrecognizable Type: %s  identify binlog type error", binlog_header->header_type_ );
+        return false;
+    }
+    return true;
+}
+
+
+
+
+
+
+

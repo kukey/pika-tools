@@ -64,10 +64,10 @@ public:
   TrysyncThread* trysync_thread() {
     return trysync_thread_;
   }
-  Binlog* logger() {
-    return logger_;
-  }
-
+//  Binlog* logger() {
+//    return logger_;
+//  }
+    Binlog *logger_;
   int SendRedisCommand(const std::string &command, const std::string &key);
 
   bool SetMaster(std::string& master_ip, int master_port);
@@ -115,7 +115,7 @@ private:
   BinlogReceiverThread* binlog_receiver_thread_;
   TrysyncThread* trysync_thread_;
 
-  Binlog *logger_;
+
 
   pthread_rwlock_t state_protector_; //protect below, use for master-slave mode
 

@@ -14,10 +14,11 @@
 #define HEADER_LEN 6
 
 #include "pink/include/pink_conn.h"
+#include "pink/include/redis_parser.h"
 #include "pika_command.h"
 
 #include "binlog_transverter.h"
-
+#include "pika_binlog_parser.h"
 class BinlogReceiverThread;
 
 enum PortTransferOperate{
@@ -32,27 +33,40 @@ class MasterConn: public pink::PinkConn {
 
   virtual pink::ReadStatus GetRequest();
   virtual pink::WriteStatus SendReply();
-  virtual void TryResizeBuffer();
 
-  pink::ReadStatus ReadRaw(uint32_t count);
-  pink::ReadStatus ReadHeader();
-  pink::ReadStatus ReadBody(uint32_t body_lenth);
-  void ResetStatus();
-
-  int32_t FindNextSeparators(const std::string& content, int32_t next_parse_pos);
-  int32_t GetNextNum(const std::string& content, int32_t next_parse_pos, int32_t pos, long* value);
-  pink::ReadStatus ParseRedisRESPArray(const std::string& content, pink::RedisCmdArgsType* argv);
 
   bool ProcessAuth(const pink::RedisCmdArgsType& argv);
   bool ProcessBinlogData(const pink::RedisCmdArgsType& argv, const PortBinlogItem& binlog_item);
 
+
+  BinlogHeader binlog_header_;
+  PortBinlogItem binlog_item_;
+
+
+
+
  private:
-  char* rbuf_;
-  uint32_t rbuf_len_;
-  uint32_t rbuf_size_;
-  uint32_t rbuf_cur_pos_;
-  bool is_authed_;
-  BinlogReceiverThread* binlog_receiver_;
+    static int DealMessage(pink::RedisParser* parser, const pink::RedisCmdArgsType& argv);
+    pink::ReadStatus ParseRedisParserStatus(pink::RedisParserStatus status);
+
+
+
+    char* rbuf_;
+    int rbuf_len_;
+    int msg_peak_;
+
+    bool is_authed_;
+
+    // For Redis Protocol parser
+    int last_read_pos_;
+    long bulk_len_;
+
+    pink::RedisParser redis_parser_;
+    PikaBinlogParser binlog_parser_;
+
+
+
+    BinlogReceiverThread* binlog_receiver_;
 };
 
 #endif

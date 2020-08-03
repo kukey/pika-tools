@@ -137,7 +137,7 @@ int PikaPort::SendRedisCommand(const std::string &command, const std::string &ke
   // Send command
   size_t idx = std::hash<std::string>()(key) % g_conf.forward_thread_num;
   senders_[idx]->SendRedisCommand(command);
-  
+
   return 0;
 }
 
@@ -244,8 +244,6 @@ void PikaPort::RemoveMaster() {
 
 bool PikaPort::IsWaitingDBSync() {
   slash::RWLock l(&state_protector_, false);
-  // pinfo("repl_state: " << PikaState(repl_state_)
-  //     << " role: " << PikaRole(role_) << " master_connection: " << master_connection_;
   if (repl_state_ == PIKA_REPL_WAIT_DBSYNC) {
     return true;
   }
